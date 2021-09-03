@@ -7,7 +7,9 @@ import (
 	"time"
 
 	"github.com/btcsuite/btcutil"
+	"github.com/btcsuite/btcd/wire"
 	"github.com/davecgh/go-spew/spew"
+	"github.com/lightningnetwork/lnd/chainreg"
 	"github.com/lightningnetwork/lnd/lnrpc"
 	"github.com/lightningnetwork/lnd/lnrpc/routerrpc"
 	"github.com/lightningnetwork/lnd/lntest"
@@ -30,6 +32,14 @@ func testSingleHopInvoice(net *lntest.NetworkHarness, t *harnessTest) {
 			Amt: chanAmt,
 		},
 	)
+	chanPointTXID, err := lnrpc.GetChanPointFundingTxid(chanPoint)
+	if err != nil {
+		t.Fatalf("unable to get txid: %v", err)
+	}
+	chanOutPoint := wire.OutPoint{
+		Hash:  *chanPointTXID,
+		Index: chanPoint.OutputIndex,
+	}
 
 	// Now that the channel is open, create an invoice for Bob which
 	// expects a payment of 1000 satoshis from Alice paid via a particular
@@ -88,15 +98,97 @@ func testSingleHopInvoice(net *lntest.NetworkHarness, t *harnessTest) {
 			spew.Sdump(dbInvoice))
 	}
 
-	// With the payment completed all balance related stats should be
-	// properly updated.
-	err = wait.NoError(
-		assertAmountSent(paymentAmt, net.Alice, net.Bob),
-		3*time.Second,
+	// With the payment completed, check the amount paid.
+	assertAmountPaid(t, "Alice => Bob", net.Bob, chanOutPoint, int64(0), paymentAmt)
+	assertAmountPaid(t, "Alice => Bob", net.Alice, chanOutPoint, paymentAmt, int64(0))
+
+	// add Carol at the end of the loop
+	// Open a channel with 100k satoshis between Bob and Carol with Bob being
+	// the sole funder of the channel.
+	carolArgs := []string{}
+	carol := net.NewNode(t.t, "Carol", carolArgs)
+	defer shutdownAndAssert(net, t, carol)
+	net.ConnectNodes(t.t, carol, net.Bob)
+	net.SendCoins(t.t, btcutil.SatoshiPerBitcoin, carol)
+	chanBCPoint := openChannelAndAssert(
+		t, net, net.Bob, carol,
+		lntest.OpenChannelParams{
+		    Amt: chanAmt,
+		},
 	)
+	chanBCPointTXID, err := lnrpc.GetChanPointFundingTxid(chanBCPoint)
 	if err != nil {
-		t.Fatalf(err.Error())
+		t.Fatalf("unable to get txid: %v", err)
 	}
+	chanBCOutPoint := wire.OutPoint{
+		Hash:  *chanBCPointTXID,
+		Index: chanBCPoint.OutputIndex,
+	}
+
+	// Now that the channel is open, create an invoice for Carol which
+	// expects a payment of 1000 satoshis from Alice 
+	invoiceCarol := &lnrpc.Invoice{
+		Memo:      "testing payment from Alice to Carol",
+		Value:     paymentAmt,
+	}
+	invoiceCarolResp, err := carol.AddInvoice(ctxb, invoiceCarol)
+	if err != nil {
+		t.Fatalf("unable to add invoice: %v", err)
+	}
+
+	// Wait for the channels to be recognized and advertised
+	err = net.Bob.WaitForNetworkChannelOpen(ctxt, chanBCPoint)
+	if err != nil {
+		t.Fatalf("bob didn't advertise channel before "+"timeout: %v", err)
+	}
+	err = carol.WaitForNetworkChannelOpen(ctxt, chanBCPoint)
+	if err != nil {
+		t.Fatalf("bob didn't advertise channel before "+"timeout: %v", err)
+	}
+
+	const bobBaseFeeSat = 42
+	const bobFeeRatePPM = 100000
+	updateChannelPolicy(
+		t, net.Bob, chanBCPoint, bobBaseFeeSat*1000,
+		bobFeeRatePPM, chainreg.DefaultBitcoinTimeLockDelta, calculateMaxHtlc(chanAmt),
+		carol,
+	)
+
+	// With the invoice for Carol added, send a payment towards Alice paying
+	// to the above generated invoice.
+	resp = sendAndAssertSuccess(
+		t, net.Alice, &routerrpc.SendPaymentRequest{
+			PaymentRequest: invoiceCarolResp.PaymentRequest,
+			TimeoutSeconds: 60,
+			FeeLimitMsat:   noFeeLimitMsat,
+		},
+	)
+
+	// Carol's invoice should now be found and marked as settled.
+	payHash = &lnrpc.PaymentHash{
+		RHash: invoiceCarolResp.RHash,
+	}
+	ctxt, _ = context.WithTimeout(ctxb, defaultTimeout)
+	dbInvoice, err = carol.LookupInvoice(ctxt, payHash)
+	if err != nil {
+		t.Fatalf("unable to lookup invoice: %v", err)
+	}
+	if !dbInvoice.Settled { // nolint:staticcheck
+		t.Fatalf("Carol's invoice should be marked as settled: %v",
+			spew.Sdump(dbInvoice))
+	}
+
+	// With the payment completed, check the amount paid.
+	assertAmountPaid(t, "Bob => Carol", carol, chanBCOutPoint, int64(0), paymentAmt)
+	assertAmountPaid(t, "Bob => Carol", net.Bob, chanBCOutPoint, paymentAmt, int64(0))
+	// To forward a payment of 1000 sat, Bob is charging a fee of
+	// 42 sat + 10% = 142 sat. (+ Alice already sent the paymentAmt of 1000 sats to Bob)
+	expectedAmountAtoB := paymentAmt + paymentAmt * bobFeeRatePPM / 1000000 + bobBaseFeeSat
+	assertAmountPaid(t, "Alice => Bob", net.Bob, chanOutPoint, int64(0), int64(paymentAmt + expectedAmountAtoB))
+	assertAmountPaid(t, "Alice => Bob", net.Alice, chanOutPoint, int64(paymentAmt + expectedAmountAtoB), int64(0))
+
+	closeChannelAndAssert(t, net, net.Bob, chanBCPoint, false)
+
 
 	// Create another invoice for Bob, this time leaving off the preimage
 	// to one will be randomly generated. We'll test the proper
@@ -124,7 +216,7 @@ func testSingleHopInvoice(net *lntest.NetworkHarness, t *harnessTest) {
 	// The second payment should also have succeeded, with the balances
 	// being update accordingly.
 	err = wait.NoError(
-		assertAmountSent(2*paymentAmt, net.Alice, net.Bob),
+		assertAmountSent(btcutil.Amount(2*paymentAmt + expectedAmountAtoB), net.Alice, net.Bob),
 		3*time.Second,
 	)
 	if err != nil {
@@ -152,7 +244,7 @@ func testSingleHopInvoice(net *lntest.NetworkHarness, t *harnessTest) {
 	// The keysend payment should also have succeeded, with the balances
 	// being update accordingly.
 	err = wait.NoError(
-		assertAmountSent(3*paymentAmt, net.Alice, net.Bob),
+		assertAmountSent(btcutil.Amount(3*paymentAmt + expectedAmountAtoB), net.Alice, net.Bob),
 		3*time.Second,
 	)
 	if err != nil {
